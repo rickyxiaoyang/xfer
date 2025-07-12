@@ -66,7 +66,6 @@ class FileScannerViewModel: ObservableObject {
             let destinationFileURLs = FileManager.default.enumerator(at: destination, includingPropertiesForKeys: nil)?.allObjects as? [URL] ?? []
 
             let destinationFileSet = Set(destinationFileURLs.map { $0.lastPathComponent })
-
             let filteredOriginURLs = originFileURLs.filter { !$0.hasDirectoryPath }
             var tempOriginFiles: [FileItem] = []
             for fileURL in filteredOriginURLs {
@@ -146,99 +145,109 @@ struct ContentView: View {
     @StateObject private var viewModel = FileScannerViewModel()
 
     var body: some View {
-        ZStack {
-        VStack {
-            HStack {
-                Button("Select Origin") {
-                    selectFolder(allowCreate: false) { url in
-                        viewModel.originURL = url
-                        if let destination = viewModel.destinationURL {
-                            viewModel.scanFiles(origin: url, destination: destination)
+        NavigationSplitView {
+            VStack(spacing: 20) {
+                Divider()
+                VStack {
+                    Button("Select Origin") {
+                        selectFolder(allowCreate: false) { url in
+                            viewModel.originURL = url
+                            if let destination = viewModel.destinationURL {
+                                viewModel.scanFiles(origin: url, destination: destination)
+                            }
                         }
+                    }
+                    if let origin = viewModel.originURL {
+                        Text("Origin: \(origin.path)")
                     }
                 }
-                Button("Select Destination") {
-                    selectFolder(allowCreate: true) { url in
-                        viewModel.destinationURL = url
-                        if let origin = viewModel.originURL {
-                            viewModel.scanFiles(origin: origin, destination: url)
+                Divider()
+                VStack {
+                    Button("Select Destination") {
+                        selectFolder(allowCreate: true) { url in
+                            viewModel.destinationURL = url
+                            if let origin = viewModel.originURL {
+                                viewModel.scanFiles(origin: origin, destination: url)
+                            }
                         }
                     }
+                    if let destination = viewModel.destinationURL {
+                        Text("Destination: \(destination.path)")
+                    }
+                }
+                Divider()
+                VStack(alignment: .leading, spacing: 8) {
+                    Toggle("Import into dated subfolders", isOn: $viewModel.importIntoDatedSubfolders)
+                    Toggle("Show only untransferred", isOn: $viewModel.showOnlyUntransferred)
                 }
                 if let origin = viewModel.originURL, let destination = viewModel.destinationURL {
                     Button("Scan") {
                         viewModel.scanFiles(origin: origin, destination: destination)
                     }
                 }
-
-            }
-
-            if let origin = viewModel.originURL {
-                Text("Origin: \(origin.path)").font(.caption)
-            }
-            if let destination = viewModel.destinationURL {
-                Text("Destination: \(destination.path)").font(.caption)
-            }
-
-            Toggle("Import into dated subfolders", isOn: $viewModel.importIntoDatedSubfolders)
-                .padding(.top)
-            Toggle("Show only untransferred", isOn: $viewModel.showOnlyUntransferred)
-            HStack {
-                TextField("Search files...", text: $viewModel.searchText)
-                Toggle("Sort by Type", isOn: $viewModel.sortByFileType).toggleStyle(.checkbox)
-                Button(viewModel.sortAscending ? "Sort A-Z" : "Sort Z-A") {
-                    viewModel.sortAscending.toggle()
+                Spacer()
+            }.navigationSplitViewColumnWidth(400)
+        } detail: {
+            VStack {
+                List {
+                    ForEach(viewModel.filteredFiles) { file in
+                        HStack {
+                            Image(systemName: "checkmark")
+                                .foregroundColor(.green)
+                                .opacity(file.existsInDestination ? 1 : 0)
+                            Text(file.url.lastPathComponent)
+                            Spacer()
+                            if !file.existsInDestination {
+                                Toggle("", isOn: Binding(
+                                    get: { file.isSelected },
+                                    set: { newValue in
+                                        if let index = viewModel.originFiles.firstIndex(where: { $0.id == file.id }) {
+                                            viewModel.originFiles[index].isSelected = newValue
+                                        }
+                                    })
+                                ).labelsHidden()
+                            }
+                        }
+                    }
                 }
-            }
-
-            List {
-                ForEach(viewModel.filteredFiles) { file in
-                    HStack {
-                        Image(systemName: "checkmark")
-                            .foregroundColor(.green)
-                            .opacity(file.existsInDestination ? 1 : 0)
-                        Text(file.url.lastPathComponent)
-                        Spacer()
-                        if !file.existsInDestination {
-                            Toggle("", isOn: Binding(
-                                get: { file.isSelected },
-                                set: { newValue in
-                                    if let index = viewModel.originFiles.firstIndex(where: { $0.id == file.id }) {
-                                        viewModel.originFiles[index].isSelected = newValue
-                                    }
-                                })
-                            ).labelsHidden()
+                .frame(minHeight: 400)
+                .overlay(
+                    Group {
+                        if viewModel.isScanning {
+                            ProgressView("Scanning files...")
+                                .progressViewStyle(CircularProgressViewStyle())
+                                .padding()
+                                .cornerRadius(10)
+                                .shadow(radius: 10)
+                        }
+                    }
+                )
+                HStack {
+                    Button("Select All Untransferred") {
+                        viewModel.selectAllUntransferred()
+                    }
+                    Button("Copy Selected Files") {
+                        if let destination = viewModel.destinationURL {
+                            viewModel.copySelectedFiles(to: destination)
+                        }
+                    }
+                }
+                .padding()
+                .searchable(text: $viewModel.searchText)
+                .toolbar {
+                    ToolbarItem(placement: .automatic) {
+                        Menu {
+                            Toggle("Sort by Type", isOn: $viewModel.sortByFileType).toggleStyle(.checkbox)
+                            Button(viewModel.sortAscending ? "Sort A-Z" : "Sort Z-A") {
+                                viewModel.sortAscending.toggle()
+                            }
+                        } label: {
+                            Label("Sort", systemImage: "arrow.up.arrow.down.circle")
                         }
                     }
                 }
             }
-            .frame(minHeight: 400)
-
-            HStack {
-                Button("Select All Untransferred") {
-                    viewModel.selectAllUntransferred()
-                }
-                Button("Copy Selected Files") {
-                    if let destination = viewModel.destinationURL {
-                        viewModel.copySelectedFiles(to: destination)
-                    }
-                }
-            }
         }
-        .padding()
-        .frame(width: 700, height: 600)
-        }
-        .overlay(
-            Group {
-                if viewModel.isScanning {
-                    ProgressView("Scanning files...")
-                        .progressViewStyle(CircularProgressViewStyle())
-                        .padding()
-                        .cornerRadius(10)
-                        .shadow(radius: 10)
-                }
-            }
-        )
     }
 
     func selectFolder(allowCreate: Bool, completion: @escaping (URL) -> Void) {
