@@ -192,12 +192,10 @@ struct ContentView: View {
                 List {
                     ForEach(viewModel.filteredFiles) { file in
                         HStack {
-                            Image(systemName: "checkmark")
-                                .foregroundColor(.green)
-                                .opacity(file.existsInDestination ? 1 : 0)
-                            Text(file.url.lastPathComponent)
-                            Spacer()
-                            if !file.existsInDestination {
+                            if file.existsInDestination {
+                                Image(systemName: "checkmark")
+                                    .foregroundColor(.green)
+                            } else {
                                 Toggle("", isOn: Binding(
                                     get: { file.isSelected },
                                     set: { newValue in
@@ -207,6 +205,8 @@ struct ContentView: View {
                                     })
                                 ).labelsHidden()
                             }
+                            Text(file.url.lastPathComponent)
+                            Spacer()
                         }
                     }
                 }
