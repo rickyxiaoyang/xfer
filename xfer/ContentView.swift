@@ -4,11 +4,13 @@ import Foundation
 struct FileItem: Identifiable {
     let id = UUID()
     let url: URL
+    let creationDate: Date?
     var existsInDestination: Bool = false
     var isSelected: Bool = false
 }
 
 class FileScannerViewModel: ObservableObject {
+    @Published var isCopying: Bool = false
     @Published var isScanning: Bool = false
     @Published var originFiles: [FileItem] = []
     @Published var destinationURL: URL? {
@@ -31,6 +33,17 @@ class FileScannerViewModel: ObservableObject {
     @Published var sortAscending: Bool = true
     @Published var sortByFileType: Bool = false
 
+    @Published var scanProgress: Double = 0
+    @Published var scannedFiles: Int = 0
+    @Published var totalFiles: Int = 0
+    @Published var lastProgressUpdate: Date = .distantPast
+
+    @Published var copyProgress: Double = 0
+    @Published var copiedFilesCount: Int = 0
+    @Published var totalFilesToCopy: Int = 0
+
+    private var scanTask: Task<Void, Never>?
+    private let progressUpdateInterval: TimeInterval = 0.15
     init() {
         if let origin = resolveBookmark(for: "LastOriginBookmark"), let destination = resolveBookmark(for: "LastDestinationBookmark") {
             self.originURL = origin
@@ -55,59 +68,134 @@ class FileScannerViewModel: ObservableObject {
             }
         }
     }
-
+    
+    func cancelScan() {
+        scanTask?.cancel()
+        scanTask = nil
+        DispatchQueue.main.async {
+            self.isScanning = false
+            self.scanProgress = 0
+        }
+    }
     func scanFiles(origin: URL, destination: URL) {
+        cancelScan()
         isScanning = true
-        self.originURL = origin
-        self.destinationURL = destination
+        scanProgress = 0
+        scannedFiles = 0
+        totalFiles = 0
+        originFiles = []
+        originURL = origin
+        destinationURL = destination
 
-        DispatchQueue.global(qos: .userInitiated).async {
-            let originFileURLs = FileManager.default.enumerator(at: origin, includingPropertiesForKeys: nil)?.allObjects as? [URL] ?? []
-            let destinationFileURLs = FileManager.default.enumerator(at: destination, includingPropertiesForKeys: nil)?.allObjects as? [URL] ?? []
-
-            let destinationFileSet = Set(destinationFileURLs.map { $0.lastPathComponent })
-            let filteredOriginURLs = originFileURLs.filter { !$0.hasDirectoryPath }
-            var tempOriginFiles: [FileItem] = []
-            for fileURL in filteredOriginURLs {
-                let fileName = fileURL.lastPathComponent
-                let exists = destinationFileSet.contains(fileName)
-                let fileItem = FileItem(url: fileURL, existsInDestination: exists)
-                tempOriginFiles.append(fileItem)
+        scanTask = Task.detached { [weak self] in
+            guard let self else { return }
+            // Build destination filename set lazily
+            var destinationNames = Set<String>()
+            if let destEnum = FileManager.default.enumerator(at: destination,
+                                                              includingPropertiesForKeys: [.isDirectoryKey],
+                                                              options: [.skipsHiddenFiles],
+                                                              errorHandler: nil) {
+                while let url = destEnum.nextObject() as? URL {
+                    if Task.isCancelled { return }
+                    if (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true { continue }
+                    destinationNames.insert(url.lastPathComponent)
+                }
             }
 
-            DispatchQueue.main.async {
-                self.originFiles = tempOriginFiles
+            var pendingItems: [FileItem] = []
+            var localTotal = 0
+
+            if let originEnum = FileManager.default.enumerator(at: origin,
+                   includingPropertiesForKeys: [.isDirectoryKey, .creationDateKey],
+                   options: [.skipsHiddenFiles],
+                   errorHandler: nil) {
+                // First pass: (optional) count total files while creating FileItem list incrementally
+                while let url = originEnum.nextObject() as? URL {
+                    if Task.isCancelled { return }
+                    let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .creationDateKey])
+                    if values?.isDirectory == true { continue }
+                    localTotal += 1
+                    let exists = destinationNames.contains(url.lastPathComponent)
+                    let item = FileItem(url: url, creationDate: values?.creationDate, existsInDestination: exists)
+                    pendingItems.append(item)
+
+                    // Progress + throttled UI updates
+                    let now = Date()
+                    if now.timeIntervalSince(self.lastProgressUpdate) > self.progressUpdateInterval {
+                        let currentTotal = localTotal
+                        let currentItems = pendingItems
+                        await MainActor.run {
+                            self.totalFiles = currentTotal
+                            self.scannedFiles = currentItems.count
+                            self.scanProgress = Double(self.scannedFiles) / Double(max(self.totalFiles, 1))
+                            self.originFiles = currentItems
+                            self.lastProgressUpdate = now
+                        }
+                    }
+                }
+            }
+            let currentTotal = localTotal
+            let currentItems = pendingItems
+            if Task.isCancelled { return }
+            await MainActor.run {
+                self.totalFiles = currentTotal
+                self.scannedFiles = currentItems.count
+                self.scanProgress = 1.0
+                self.originFiles = currentItems
                 self.isScanning = false
             }
         }
     }
-
     func copySelectedFiles(to destination: URL) {
-        for file in originFiles where file.isSelected && !file.existsInDestination {
-            var destURL = destination
+        let filesToCopy = self.originFiles.filter { $0.isSelected && !$0.existsInDestination }
+        guard !filesToCopy.isEmpty else { return }
 
-            if importIntoDatedSubfolders {
-                if let creationDate = try? FileManager.default.attributesOfItem(atPath: file.url.path)[.creationDate] as? Date {
-                    let formatter = DateFormatter()
-                    formatter.dateFormat = "MM-dd-yyyy"
-                    let folderName = formatter.string(from: creationDate)
-                    destURL = destURL.appendingPathComponent(folderName)
+        isCopying = true
+        copiedFilesCount = 0
+        totalFilesToCopy = filesToCopy.count
+        copyProgress = 0
+        
+        Task {
+            let dateFormatter: DateFormatter = {
+                let df = DateFormatter()
+                df.dateFormat = "MM-dd-yyyy"
+                return df
+            }()
+            
+            // Perform file operations on a background thread
+            await Task.detached(priority: .userInitiated) {
+                for file in filesToCopy {
+                    var destFolder = destination
+                    
+                    if self.importIntoDatedSubfolders, let creationDate = file.creationDate {
+                        let folderName = dateFormatter.string(from: creationDate)
+                        destFolder = destFolder.appendingPathComponent(folderName)
+                        
+                        try? FileManager.default.createDirectory(at: destFolder, withIntermediateDirectories: true, attributes: nil)
+                    }
+                    
+                    let destURL = destFolder.appendingPathComponent(file.url.lastPathComponent)
+                    
+                    do {
+                        try FileManager.default.copyItem(at: file.url, to: destURL)
+                        // Update progress on the main thread
+                        await MainActor.run {
+                            self.copiedFilesCount += 1
+                            self.copyProgress = Double(self.copiedFilesCount) / Double(self.totalFilesToCopy)
+                        }
+                    } catch {
+                        print("Failed to copy \(file.url): \(error)")
+                    }
+                }
+            }.value
 
-                    try? FileManager.default.createDirectory(at: destURL, withIntermediateDirectories: true, attributes: nil)
+            // After copying, switch back to the main thread to update state and start the new scan
+            await MainActor.run {
+                self.isCopying = false
+                if let origin = self.originURL, let destination = self.destinationURL {
+                    self.scanFiles(origin: origin, destination: destination)
                 }
             }
-
-            destURL = destURL.appendingPathComponent(file.url.lastPathComponent)
-
-            do {
-                try FileManager.default.copyItem(at: file.url, to: destURL)
-            } catch {
-                print("Failed to copy \(file.url): \(error)")
-            }
-        }
-
-        if let origin = originFiles.first?.url.deletingLastPathComponent(), let destination = destinationURL {
-            scanFiles(origin: origin, destination: destination)
         }
     }
 
@@ -185,6 +273,33 @@ struct ContentView: View {
                         viewModel.scanFiles(origin: origin, destination: destination)
                     }
                 }
+                if viewModel.isScanning {
+                    Divider()
+                    VStack {
+                        ProgressView(value: viewModel.scanProgress) {
+                            Text("Scanning…")
+                        } currentValueLabel: {
+                            Text("\(viewModel.scannedFiles) of \(viewModel.totalFiles) files")
+                        }
+                        .progressViewStyle(.linear)
+                        
+                        Button("Cancel") {
+                            viewModel.cancelScan()
+                        }
+                    }
+                    .padding()
+                }
+                if viewModel.isCopying {
+                    Divider()
+                    VStack {
+                        ProgressView(value: viewModel.copyProgress) {
+                            Text("Copying files...")
+                        } currentValueLabel: {
+                            Text("\(viewModel.copiedFilesCount) of \(viewModel.totalFilesToCopy) files")
+                        }
+                        .progressViewStyle(.linear)
+                    }.padding()
+                }
                 Spacer()
             }.navigationSplitViewColumnWidth(400)
         } detail: {
@@ -211,17 +326,6 @@ struct ContentView: View {
                     }
                 }
                 .frame(minHeight: 400)
-                .overlay(
-                    Group {
-                        if viewModel.isScanning {
-                            ProgressView("Scanning files...")
-                                .progressViewStyle(CircularProgressViewStyle())
-                                .padding()
-                                .cornerRadius(10)
-                                .shadow(radius: 10)
-                        }
-                    }
-                )
                 HStack {
                     Button("Select All Untransferred") {
                         viewModel.selectAllUntransferred()
@@ -245,7 +349,7 @@ struct ContentView: View {
                             Label("Sort", systemImage: "arrow.up.arrow.down.circle")
                         }
                     }
-                }
+                }   
             }
         }
     }
