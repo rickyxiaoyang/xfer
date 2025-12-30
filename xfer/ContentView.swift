@@ -36,19 +36,28 @@ class FileScannerViewModel: ObservableObject {
     @Published var scanProgress: Double = 0
     @Published var scannedFiles: Int = 0
     @Published var totalFiles: Int = 0
-    @Published var lastProgressUpdate: Date = .distantPast
 
     @Published var copyProgress: Double = 0
     @Published var copiedFilesCount: Int = 0
     @Published var totalFilesToCopy: Int = 0
+    
+    @Published var errorMessage: String?
 
     private var scanTask: Task<Void, Never>?
     private let progressUpdateInterval: TimeInterval = 0.15
+    private var activeSecurityScopedURLs: [URL] = []
+    
     init() {
         if let origin = resolveBookmark(for: "LastOriginBookmark"), let destination = resolveBookmark(for: "LastDestinationBookmark") {
             self.originURL = origin
             self.destinationURL = destination
             scanFiles(origin: origin, destination: destination)
+        }
+    }
+    
+    deinit {
+        for url in activeSecurityScopedURLs {
+            url.stopAccessingSecurityScopedResource()
         }
     }
 
@@ -84,17 +93,45 @@ class FileScannerViewModel: ObservableObject {
         scannedFiles = 0
         totalFiles = 0
         originFiles = []
+        errorMessage = nil
         originURL = origin
         destinationURL = destination
 
+        // Capture values for the detached task to avoid accessing self properties
+        let updateInterval = progressUpdateInterval
+
         scanTask = Task.detached { [weak self] in
             guard let self else { return }
+            
+            // Check if directories are accessible
+            let originAccessible = FileManager.default.isReadableFile(atPath: origin.path)
+            let destAccessible = FileManager.default.isReadableFile(atPath: destination.path)
+            
+            if !originAccessible {
+                await MainActor.run {
+                    self.errorMessage = "Cannot access origin folder: \(origin.path)"
+                    self.isScanning = false
+                }
+                return
+            }
+            
+            if !destAccessible {
+                await MainActor.run {
+                    self.errorMessage = "Cannot access destination folder: \(destination.path)"
+                    self.isScanning = false
+                }
+                return
+            }
+            
             // Build destination filename set lazily
             var destinationNames = Set<String>()
             if let destEnum = FileManager.default.enumerator(at: destination,
                                                               includingPropertiesForKeys: [.isDirectoryKey],
                                                               options: [.skipsHiddenFiles],
-                                                              errorHandler: nil) {
+                                                              errorHandler: { url, error in
+                                                                  print("Error enumerating destination \(url): \(error)")
+                                                                  return true // Continue enumeration
+                                                              }) {
                 while let url = destEnum.nextObject() as? URL {
                     if Task.isCancelled { return }
                     if (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true { continue }
@@ -104,11 +141,15 @@ class FileScannerViewModel: ObservableObject {
 
             var pendingItems: [FileItem] = []
             var localTotal = 0
+            var lastUpdateTime = Date.distantPast
 
             if let originEnum = FileManager.default.enumerator(at: origin,
                    includingPropertiesForKeys: [.isDirectoryKey, .creationDateKey],
                    options: [.skipsHiddenFiles],
-                   errorHandler: nil) {
+                   errorHandler: { url, error in
+                       print("Error enumerating origin \(url): \(error)")
+                       return true // Continue enumeration
+                   }) {
                 // First pass: (optional) count total files while creating FileItem list incrementally
                 while let url = originEnum.nextObject() as? URL {
                     if Task.isCancelled { return }
@@ -121,15 +162,15 @@ class FileScannerViewModel: ObservableObject {
 
                     // Progress + throttled UI updates
                     let now = Date()
-                    if now.timeIntervalSince(self.lastProgressUpdate) > self.progressUpdateInterval {
+                    if now.timeIntervalSince(lastUpdateTime) > updateInterval {
                         let currentTotal = localTotal
                         let currentItems = pendingItems
+                        lastUpdateTime = now
                         await MainActor.run {
                             self.totalFiles = currentTotal
                             self.scannedFiles = currentItems.count
-                            self.scanProgress = Double(self.scannedFiles) / Double(max(self.totalFiles, 1))
+                            self.scanProgress = Double(currentItems.count) / Double(max(currentTotal, 1))
                             self.originFiles = currentItems
-                            self.lastProgressUpdate = now
                         }
                     }
                 }
@@ -155,6 +196,11 @@ class FileScannerViewModel: ObservableObject {
         totalFilesToCopy = filesToCopy.count
         copyProgress = 0
         
+        // Capture values for the detached task
+        let importIntoDated = importIntoDatedSubfolders
+        let updateInterval = progressUpdateInterval
+        let total = filesToCopy.count
+        
         Task {
             let dateFormatter: DateFormatter = {
                 let df = DateFormatter()
@@ -163,14 +209,14 @@ class FileScannerViewModel: ObservableObject {
             }()
             
             // Perform file operations on a background thread
-            await Task.detached(priority: .userInitiated) {
+            await Task.detached(priority: .userInitiated) { [weak self] in
                 var localCopiedCount = 0
                 var lastUpdateTime = Date.distantPast
 
                 for file in filesToCopy {
                     var destFolder = destination
                     
-                    if self.importIntoDatedSubfolders, let creationDate = file.creationDate {
+                    if importIntoDated, let creationDate = file.creationDate {
                         let folderName = dateFormatter.string(from: creationDate)
                         destFolder = destFolder.appendingPathComponent(folderName)
                         
@@ -185,13 +231,13 @@ class FileScannerViewModel: ObservableObject {
 
                         // Throttle UI updates
                         let now = Date()
-                        if now.timeIntervalSince(lastUpdateTime) > self.progressUpdateInterval {
+                        if now.timeIntervalSince(lastUpdateTime) > updateInterval {
                             let currentCopiedCount = localCopiedCount
-                            await MainActor.run {
-                                self.copiedFilesCount = currentCopiedCount
-                                self.copyProgress = Double(currentCopiedCount) / Double(self.totalFilesToCopy)
-                            }
                             lastUpdateTime = now
+                            await MainActor.run { [weak self] in
+                                self?.copiedFilesCount = currentCopiedCount
+                                self?.copyProgress = Double(currentCopiedCount) / Double(total)
+                            }
                         }
                     } catch {
                         print("Failed to copy \(file.url): \(error)")
@@ -200,13 +246,14 @@ class FileScannerViewModel: ObservableObject {
                 // Final progress update
                 let finalCopiedCount = localCopiedCount
                 await MainActor.run {
-                    self.copiedFilesCount = finalCopiedCount
-                    self.copyProgress = Double(finalCopiedCount) / Double(self.totalFilesToCopy)
+                    self?.copiedFilesCount = finalCopiedCount
+                    self?.copyProgress = 1.0
                 }
             }.value
 
             // After copying, switch back to the main thread to update state and start the new scan
-            await MainActor.run {
+            await MainActor.run { [weak self] in
+                guard let self else { return }
                 self.isCopying = false
                 if let origin = self.originURL, let destination = self.destinationURL {
                     self.scanFiles(origin: origin, destination: destination)
@@ -234,7 +281,16 @@ class FileScannerViewModel: ObservableObject {
         var isStale = false
         do {
             let url = try URL(resolvingBookmarkData: bookmarkData, options: [.withSecurityScope], relativeTo: nil, bookmarkDataIsStale: &isStale)
-            if !url.startAccessingSecurityScopedResource() {
+            
+            if isStale {
+                // Re-save the bookmark if it's stale
+                print("Bookmark for \(key) is stale, attempting to refresh...")
+                saveBookmark(for: url, key: key)
+            }
+            
+            if url.startAccessingSecurityScopedResource() {
+                activeSecurityScopedURLs.append(url)
+            } else {
                 print("Failed to start accessing security scoped resource for \(key)")
             }
             return url
@@ -288,6 +344,14 @@ struct ContentView: View {
                     Button("Scan") {
                         viewModel.scanFiles(origin: origin, destination: destination)
                     }
+                    .disabled(viewModel.isScanning || viewModel.isCopying)
+                }
+                if let errorMessage = viewModel.errorMessage {
+                    Divider()
+                    Text(errorMessage)
+                        .foregroundColor(.red)
+                        .font(.caption)
+                        .padding(.horizontal)
                 }
                 if viewModel.isScanning {
                     Divider()
@@ -346,11 +410,14 @@ struct ContentView: View {
                     Button("Select All Untransferred") {
                         viewModel.selectAllUntransferred()
                     }
+                    .disabled(viewModel.isScanning || viewModel.isCopying)
+                    
                     Button("Copy Selected Files") {
                         if let destination = viewModel.destinationURL {
                             viewModel.copySelectedFiles(to: destination)
                         }
                     }
+                    .disabled(viewModel.isScanning || viewModel.isCopying)
                 }
                 .padding()
                 .searchable(text: $viewModel.searchText)
