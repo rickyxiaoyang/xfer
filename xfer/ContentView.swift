@@ -164,6 +164,9 @@ class FileScannerViewModel: ObservableObject {
             
             // Perform file operations on a background thread
             await Task.detached(priority: .userInitiated) {
+                var localCopiedCount = 0
+                var lastUpdateTime = Date.distantPast
+
                 for file in filesToCopy {
                     var destFolder = destination
                     
@@ -178,14 +181,27 @@ class FileScannerViewModel: ObservableObject {
                     
                     do {
                         try FileManager.default.copyItem(at: file.url, to: destURL)
-                        // Update progress on the main thread
-                        await MainActor.run {
-                            self.copiedFilesCount += 1
-                            self.copyProgress = Double(self.copiedFilesCount) / Double(self.totalFilesToCopy)
+                        localCopiedCount += 1
+
+                        // Throttle UI updates
+                        let now = Date()
+                        if now.timeIntervalSince(lastUpdateTime) > self.progressUpdateInterval {
+                            let currentCopiedCount = localCopiedCount
+                            await MainActor.run {
+                                self.copiedFilesCount = currentCopiedCount
+                                self.copyProgress = Double(currentCopiedCount) / Double(self.totalFilesToCopy)
+                            }
+                            lastUpdateTime = now
                         }
                     } catch {
                         print("Failed to copy \(file.url): \(error)")
                     }
+                }
+                // Final progress update
+                let finalCopiedCount = localCopiedCount
+                await MainActor.run {
+                    self.copiedFilesCount = finalCopiedCount
+                    self.copyProgress = Double(finalCopiedCount) / Double(self.totalFilesToCopy)
                 }
             }.value
 
